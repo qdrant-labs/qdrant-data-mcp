@@ -23,7 +23,7 @@ import {
 import type { RouteMap } from "@prefecthq/fastmcp-ts/server";
 import { parseArgs } from "@std/cli/parse-args";
 
-const VERSION = "v1.20.0"
+const VERSION = "v1.20.0";
 const DEFAULT_SPEC =
   `https://raw.githubusercontent.com/qdrant/qdrant/${VERSION}/docs/redoc/master/openapi.json`;
 const WRITER_TAG = "writer";

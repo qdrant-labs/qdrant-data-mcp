@@ -13,6 +13,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     permissions:
       contents: write # to create the tag and GitHub release
+      actions: write # to dispatch the Docker image build
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,3 +59,8 @@ jobs:
           prerelease: ${{ contains(steps.version.outputs.version, '-') }}
           generateReleaseNotes: true
           artifacts: "dist/*"
+
+      - name: Dispatch Docker image build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docker-image.yaml -f tag=${{ steps.version.outputs.version }}
