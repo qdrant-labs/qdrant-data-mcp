@@ -1,0 +1,35 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  checks:
+    name: Workspace CI
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read # Needed to clone the repository
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v6
+
+      - name: Install Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install deps
+        run: deno install
+
+      - name: Lint
+        run: deno lint
+
+      - name: Format
+        run: deno fmt --check
+
+      - name: Test
+        run: deno test --allow-env

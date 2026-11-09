@@ -1,0 +1,4 @@
+dist/
+qdrant-data-mcp
+.env
+.env.*
