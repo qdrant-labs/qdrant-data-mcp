@@ -70,7 +70,15 @@ Deno.test("writer tag is applied only to mutating tools", () => {
 });
 
 import { assertThrows } from "@std/assert";
-import { resolveAuth, toList } from "./main.ts";
+import {
+  assertSafeQCIUrl,
+  MCP_VERSION,
+  qdrantVersion,
+  resolveAuth,
+  resolveHeaders,
+  resolveQCIExternConfig,
+  toList,
+} from "./main.ts";
 
 const NO_AUTH = { authServers: [], audience: [] };
 const FULL = {
@@ -123,4 +131,88 @@ Deno.test("server builds with auth configured", () => {
     auth: cfg,
   });
   assertEquals(tools.length, 3);
+});
+
+const QCI_ENV = [
+  "OPENAI_API_KEY",
+  "COHERE_API_KEY",
+  "JINA_API_KEY",
+  "OPENROUTER_API_KEY",
+];
+
+function withEnv(values: Record<string, string>, fn: () => void) {
+  const saved = QCI_ENV.map((k) => [k, Deno.env.get(k)] as const);
+  QCI_ENV.forEach((k) => Deno.env.delete(k));
+  Object.entries(values).forEach(([k, v]) => Deno.env.set(k, v));
+  try {
+    fn();
+  } finally {
+    for (const [k, v] of saved) {
+      if (v === undefined) Deno.env.delete(k);
+      else Deno.env.set(k, v);
+    }
+  }
+}
+
+const BASE = { spec: "", url: "https://q.example.com", enableWrites: false };
+
+Deno.test("qci: no provider keys in env resolves to undefined", () => {
+  withEnv({}, () => assertEquals(resolveQCIExternConfig(), undefined));
+});
+
+Deno.test("qci: provider keys are read from env", () => {
+  withEnv({ OPENROUTER_API_KEY: "or", JINA_API_KEY: "jn" }, () => {
+    const cfg = resolveQCIExternConfig()!;
+    assertEquals(cfg.openrouterKey, "or");
+    assertEquals(cfg.jinaKey, "jn");
+    assertEquals(cfg.openaiKey, undefined);
+  });
+});
+
+Deno.test("headers: only api-key without the qci config", () => {
+  assertEquals(resolveHeaders({ ...BASE, apiKey: "q" }), { "api-key": "q" });
+  assertEquals(resolveHeaders(BASE), {});
+});
+
+Deno.test("headers: each provider key maps to its header", () => {
+  const headers = resolveHeaders({
+    ...BASE,
+    apiKey: "q",
+    cloudInferenceExt: {
+      openaiKey: "o",
+      cohereKey: "c",
+      jinaKey: "j",
+      openrouterKey: "r",
+    },
+  });
+  assertEquals(headers, {
+    "api-key": "q",
+    "openai-api-key": "o",
+    "cohere-api-key": "c",
+    "jina-api-key": "j",
+    "openrouter-api-key": "r",
+  });
+});
+
+Deno.test("qci: keys are only sent over https or to localhost", () => {
+  assertSafeQCIUrl("https://xyz.cloud.qdrant.io:6333");
+  assertSafeQCIUrl("http://localhost:6333");
+  assertSafeQCIUrl("http://127.0.0.1:6333");
+  assertThrows(
+    () => assertSafeQCIUrl("http://qdrant.internal:6333"),
+    Error,
+    "must use https",
+  );
+});
+
+Deno.test("version: the Qdrant version is the MCP version without the server revision", () => {
+  assertEquals(qdrantVersion("v1.20.0-server.3"), "v1.20.0");
+  assertEquals(qdrantVersion("1.21.0-server.1"), "v1.21.0");
+  assertEquals(qdrantVersion("v1.20.0-server.2-rc.1"), "v1.20.0");
+  assertEquals(qdrantVersion("v1.20.0"), "v1.20.0");
+  assertThrows(() => qdrantVersion("server.1"), Error, "Cannot read");
+});
+
+Deno.test("version: the version in deno.json is v<qdrant>-server.<n>", () => {
+  assertEquals(/^v\d+\.\d+\.\d+-server\.\d+$/.test(MCP_VERSION), true);
 });

@@ -11,6 +11,9 @@
  *   --openapi        QDRANT_OPENAPI          (path or URL; default v1.20.0 spec on GitHub)
  *   --enable-writes  QDRANT_WRITES_ENABLED=1
  *
+ * --qci-external-providers sends the provider keys found in the env
+ * (OPENAI_/COHERE_/JINA_/OPENROUTER_API_KEY) as headers to Qdrant Cloud Inference.
+ *
  * HTTP auth (bearer JWTs verified against a JWKS, see resolveAuth below) is
  * enabled by setting --jwks, --public-url and --auth-server, or their AUTH_*
  * env vars. Auth options without --http are an error, never silently ignored.
@@ -22,10 +25,21 @@ import {
 } from "@prefecthq/fastmcp-ts/server";
 import type { RouteMap } from "@prefecthq/fastmcp-ts/server";
 import { parseArgs } from "@std/cli/parse-args";
+import denoJson from "./deno.json" with { type: "json" };
 
-const VERSION = "v1.20.0";
-const DEFAULT_SPEC =
-  `https://raw.githubusercontent.com/qdrant/qdrant/${VERSION}/docs/redoc/master/openapi.json`;
+// Versions look like "1.20.0-server.1": the Qdrant version this targets,
+// plus the revision of the server itself.
+export const MCP_VERSION = `v${denoJson.version}`;
+
+export function qdrantVersion(version: string): string {
+  const match = version.match(/^v?(\d+\.\d+\.\d+)(-|$)/);
+  if (!match) throw new Error(`Cannot read a Qdrant version from "${version}"`);
+  return `v${match[1]}`;
+}
+
+const DEFAULT_SPEC = `https://raw.githubusercontent.com/qdrant/qdrant/${
+  qdrantVersion(MCP_VERSION)
+}/docs/redoc/master/openapi.json`;
 const WRITER_TAG = "writer";
 const READER_TAG = "reader";
 
@@ -36,7 +50,11 @@ Options:
   --api-key <key>    Qdrant API key              (env: QDRANT_API_KEY)
   --openapi <src>    OpenAPI spec path or URL    (env: QDRANT_OPENAPI)
   --enable-writes    Expose insert/update/delete (env: QDRANT_WRITES_ENABLED=1)
-  --http             Serve streamable HTTP instead of stdio
+  --qci-external-providers
+                     Send OPENAI_API_KEY, COHERE_API_KEY, JINA_API_KEY, and
+                     OPENROUTER_API_KEY from the env to Qdrant Cloud Inference
+                     as headers (requires an https --url)
+  --http           Serve streamable HTTP instead of stdio
   --host <host>      HTTP host (default 127.0.0.1)
   --port <port>      HTTP port (default 8000)
   --list             Print exposed tools and exit
@@ -175,12 +193,72 @@ export function resolveAuth(i: AuthInputs): AuthConfig | undefined {
   };
 }
 
+export interface QCIExternConfig {
+  openaiKey?: string;
+  openrouterKey?: string;
+  cohereKey?: string;
+  jinaKey?: string;
+}
+
+export function resolveQCIExternConfig(): QCIExternConfig | undefined {
+  const cfg: QCIExternConfig = {
+    openrouterKey: Deno.env.get("OPENROUTER_API_KEY"),
+    openaiKey: Deno.env.get("OPENAI_API_KEY"),
+    cohereKey: Deno.env.get("COHERE_API_KEY"),
+    jinaKey: Deno.env.get("JINA_API_KEY"),
+  };
+  const anyset = cfg.openaiKey || cfg.cohereKey || cfg.jinaKey ||
+    cfg.openrouterKey;
+  if (anyset) {
+    return cfg;
+  }
+}
+
+// The keys go out on every request, so refuse to send them over plain HTTP
+// to a remote host.
+export function assertSafeQCIUrl(url: string): void {
+  const { protocol, hostname, host } = new URL(url);
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(hostname);
+  if (protocol !== "https:" && !local) {
+    throw new Error(
+      "--qci-external-providers sends provider API keys to Qdrant, so --url " +
+        `must use https (got ${protocol}//${host})`,
+    );
+  }
+}
+
 export interface ServerConfig {
   spec: string;
   url: string;
   apiKey?: string;
   enableWrites: boolean;
   auth?: AuthConfig;
+  cloudInferenceExt?: QCIExternConfig;
+}
+
+export function resolveHeaders(cfg: ServerConfig): Record<string, string> {
+  const headers: Record<string, string> = {};
+
+  if (cfg.apiKey) {
+    headers["api-key"] = cfg.apiKey;
+  }
+
+  if (cfg.cloudInferenceExt) {
+    if (cfg.cloudInferenceExt.cohereKey) {
+      headers["cohere-api-key"] = cfg.cloudInferenceExt.cohereKey;
+    }
+    if (cfg.cloudInferenceExt.jinaKey) {
+      headers["jina-api-key"] = cfg.cloudInferenceExt.jinaKey;
+    }
+    if (cfg.cloudInferenceExt.openaiKey) {
+      headers["openai-api-key"] = cfg.cloudInferenceExt.openaiKey;
+    }
+    if (cfg.cloudInferenceExt.openrouterKey) {
+      headers["openrouter-api-key"] = cfg.cloudInferenceExt.openrouterKey;
+    }
+  }
+
+  return headers;
 }
 
 export interface ToolInfo {
@@ -199,13 +277,14 @@ export function buildServer(cfg: ServerConfig) {
     baseUrl: cfg.auth.productionUrl,
     authorizationServers: cfg.auth.authorizationServers,
   });
+  const headers = resolveHeaders(cfg);
   const server = createOpenAPIServer({
     spec: cfg.spec,
     name: "Qdrant Data MCP",
-    version: VERSION,
+    version: denoJson.version,
     client: {
       baseUrl: cfg.url,
-      headers: cfg.apiKey ? { "api-key": cfg.apiKey } : {},
+      headers,
     },
     routeMaps: buildRouteMaps(cfg.enableWrites),
     // Called for every component that gets registered, so it doubles as the
@@ -233,7 +312,14 @@ async function main() {
       "issuer",
     ],
     collect: ["audience", "auth-server"],
-    boolean: ["enable-writes", "http", "list", "help", "version"],
+    boolean: [
+      "enable-writes",
+      "http",
+      "list",
+      "help",
+      "version",
+      "qci-external-providers",
+    ],
     alias: { h: "help", v: "version" },
   });
 
@@ -243,7 +329,7 @@ async function main() {
   }
 
   if (args.version) {
-    console.log(VERSION);
+    console.log(MCP_VERSION);
     return;
   }
 
@@ -266,6 +352,26 @@ async function main() {
       env("AUTH_AUDIENCE"),
     ),
   });
+
+  const url = args.url ?? Deno.env.get("QDRANT_URL") ?? "http://localhost:6333";
+  const qciExtern = args["qci-external-providers"]
+    ? resolveQCIExternConfig()
+    : undefined;
+  if (args["qci-external-providers"] && !args.list) {
+    if (!qciExtern) {
+      throw new Error(
+        "--qci-external-providers is set, but none of OPENAI_API_KEY, " +
+          "COHERE_API_KEY, JINA_API_KEY, or OPENROUTER_API_KEY is in the environment",
+      );
+    }
+    assertSafeQCIUrl(url);
+    const names = Object.entries(qciExtern)
+      .filter(([, key]) => key)
+      .map(([name]) => name.replace(/Key$/, ""));
+    console.error(
+      `forwarding ${names.join(", ")} API keys to ${new URL(url).host}`,
+    );
+  }
 
   const host = args.host ?? "127.0.0.1";
   const port = Number(args.port ?? 8000);
@@ -310,10 +416,11 @@ async function main() {
     spec: await loadSpec(
       args.openapi ?? Deno.env.get("QDRANT_OPENAPI") ?? DEFAULT_SPEC,
     ),
-    url: args.url ?? Deno.env.get("QDRANT_URL") ?? "http://localhost:6333",
+    url,
     apiKey: args["api-key"] ?? Deno.env.get("QDRANT_API_KEY"),
     enableWrites,
     auth,
+    cloudInferenceExt: qciExtern,
   });
 
   if (args.list) {
