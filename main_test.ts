@@ -69,7 +69,7 @@ Deno.test("writer tag is applied only to mutating tools", () => {
   assertEquals(writers, ["delete_collection", "upsert_points"]);
 });
 
-import { assertThrows } from "@std/assert";
+import { assertRejects, assertThrows } from "@std/assert";
 import {
   assertSafeQCIUrl,
   MCP_VERSION,
@@ -78,6 +78,7 @@ import {
   resolveHeaders,
   resolveQCIExternConfig,
   toList,
+  withLocalEmbeddings,
 } from "./main.ts";
 
 const NO_AUTH = { authServers: [], audience: [] };
@@ -215,4 +216,111 @@ Deno.test("version: the Qdrant version is the MCP version without the server rev
 
 Deno.test("version: the version in deno.json is v<qdrant>-server.<n>", () => {
   assertEquals(/^v\d+\.\d+\.\d+-server\.\d+$/.test(MCP_VERSION), true);
+});
+
+// Plays both the embeddings endpoint and Qdrant. Each text embeds to
+// [text length, 1], and the data comes back reversed to exercise the sorting.
+function fakeFetch(embeddingsStatus = 200) {
+  const calls: {
+    url: string;
+    raw?: string;
+    headers: Record<string, string>;
+  }[] = [];
+  const impl: typeof fetch = (input, init) => {
+    const url = String(input);
+    const raw = init?.body as string | undefined;
+    calls.push({ url, raw, headers: init?.headers as Record<string, string> });
+    if (!url.endsWith("/embeddings")) {
+      return Promise.resolve(new Response("{}"));
+    }
+    if (embeddingsStatus !== 200) {
+      return Promise.resolve(
+        new Response("boom", { status: embeddingsStatus }),
+      );
+    }
+    const input_: string[] = JSON.parse(raw!).input;
+    const data = input_
+      .map((t, index) => ({ index, embedding: [t.length, 1] }))
+      .reverse();
+    return Promise.resolve(new Response(JSON.stringify({ data })));
+  };
+  return { impl, calls };
+}
+
+const EMB = { url: "http://localhost:11434/v1/" };
+const forwarded = (calls: { url: string; raw?: string }[]) =>
+  JSON.parse(calls.find((c) => c.url.includes("/collections"))!.raw!);
+
+Deno.test("embeddings: local/ texts in an upsert are replaced by vectors", async () => {
+  const { impl, calls } = fakeFetch();
+  await withLocalEmbeddings(EMB, impl)("http://q/collections/c/points", {
+    method: "PUT",
+    body: JSON.stringify({
+      points: [
+        { id: 1, vector: { dense: { text: "abc", model: "local/m" } } },
+        { id: 2, vector: { text: "hello", model: "local/m" } },
+      ],
+    }),
+  });
+  const embedCalls = calls.filter((c) => c.url.endsWith("/embeddings"));
+  assertEquals(embedCalls.length, 1);
+  assertEquals(embedCalls[0].url, "http://localhost:11434/v1/embeddings");
+  assertEquals(JSON.parse(embedCalls[0].raw!), {
+    model: "m",
+    input: ["abc", "hello"],
+  });
+  const body = forwarded(calls);
+  assertEquals(body.points[0].vector, { dense: [3, 1] });
+  assertEquals(body.points[1].vector, [5, 1]);
+});
+
+Deno.test("embeddings: queries and prefetches are replaced, one call per model", async () => {
+  const { impl, calls } = fakeFetch();
+  await withLocalEmbeddings(EMB, impl)("http://q/collections/c/points/query", {
+    method: "POST",
+    body: JSON.stringify({
+      prefetch: [{ query: { text: "xy", model: "local/m" }, using: "d" }],
+      query: { text: "z", model: "local/other" },
+    }),
+  });
+  assertEquals(calls.filter((c) => c.url.endsWith("/embeddings")).length, 2);
+  const body = forwarded(calls);
+  assertEquals(body.prefetch[0].query, [2, 1]);
+  assertEquals(body.query, [1, 1]);
+});
+
+Deno.test("embeddings: other models and bodies pass through untouched", async () => {
+  const { impl, calls } = fakeFetch();
+  const raw = JSON.stringify({
+    query: { text: "a", model: "sentence-transformers/all-minilm-l6-v2" },
+  });
+  await withLocalEmbeddings(EMB, impl)("http://q/collections/c/points/query", {
+    method: "POST",
+    body: raw,
+  });
+  assertEquals(calls.length, 1);
+  assertEquals(calls[0].raw, raw);
+});
+
+Deno.test("embeddings: the api key is sent as a bearer token", async () => {
+  const { impl, calls } = fakeFetch();
+  await withLocalEmbeddings({ ...EMB, apiKey: "k" }, impl)("http://q/x", {
+    method: "POST",
+    body: JSON.stringify({ query: { text: "a", model: "local/m" } }),
+  });
+  assertEquals(calls[0].headers.authorization, "Bearer k");
+});
+
+Deno.test("embeddings: a failing endpoint rejects the request", async () => {
+  const { impl, calls } = fakeFetch(500);
+  await assertRejects(
+    () =>
+      withLocalEmbeddings(EMB, impl)("http://q/x", {
+        method: "POST",
+        body: JSON.stringify({ query: { text: "a", model: "local/m" } }),
+      }),
+    Error,
+    "Embeddings request failed (500)",
+  );
+  assertEquals(calls.some((c) => !c.url.endsWith("/embeddings")), false);
 });

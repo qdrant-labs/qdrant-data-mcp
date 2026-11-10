@@ -54,7 +54,14 @@ Options:
                      Send OPENAI_API_KEY, COHERE_API_KEY, JINA_API_KEY, and
                      OPENROUTER_API_KEY from the env to Qdrant Cloud Inference
                      as headers (requires an https --url)
-  --http           Serve streamable HTTP instead of stdio
+  --embeddings-url <url>
+                     OpenAI-compatible embeddings endpoint (for example Ollama's
+                     http://localhost:11434/v1). Texts sent with a "local/<model>"
+                     model are embedded there before reaching Qdrant
+                     (env: QDRANT_EMBEDDINGS_URL)
+  --embeddings-api-key <key>
+                     Bearer token for that endpoint (env: QDRANT_EMBEDDINGS_API_KEY)
+  --http             Serve streamable HTTP instead of stdio
   --host <host>      HTTP host (default 127.0.0.1)
   --port <port>      HTTP port (default 8000)
   --list             Print exposed tools and exit
@@ -227,6 +234,103 @@ export function assertSafeQCIUrl(url: string): void {
   }
 }
 
+const LOCAL_PREFIX = "local/";
+
+export interface EmbeddingsConfig {
+  url: string;
+  apiKey?: string;
+}
+
+type DocRef = {
+  parent: Record<string, unknown>;
+  key: string;
+  text: string;
+  model: string;
+};
+
+// Finds every {"text": ..., "model": "local/<name>"} object in a request body.
+function collectLocalDocs(node: unknown, refs: DocRef[]): void {
+  if (!node || typeof node !== "object") return;
+  for (const [key, value] of Object.entries(node)) {
+    const doc = value as { text?: unknown; model?: unknown } | null;
+    if (
+      typeof doc?.text === "string" && typeof doc.model === "string" &&
+      doc.model.startsWith(LOCAL_PREFIX)
+    ) {
+      refs.push({
+        parent: node as Record<string, unknown>,
+        key,
+        text: doc.text,
+        model: doc.model.slice(LOCAL_PREFIX.length),
+      });
+    } else {
+      collectLocalDocs(value, refs);
+    }
+  }
+}
+
+async function embed(
+  cfg: EmbeddingsConfig,
+  fetchImpl: typeof fetch,
+  model: string,
+  input: string[],
+): Promise<number[][]> {
+  const res = await fetchImpl(`${cfg.url.replace(/\/+$/, "")}/embeddings`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(cfg.apiKey ? { authorization: `Bearer ${cfg.apiKey}` } : {}),
+    },
+    body: JSON.stringify({ model, input }),
+  });
+  if (!res.ok) {
+    throw new Error(
+      `Embeddings request failed (${res.status}): ${await res.text()}`,
+    );
+  }
+  const { data } = await res.json() as {
+    data?: { index?: number; embedding: number[] }[];
+  };
+  if (data?.length !== input.length) {
+    throw new Error(
+      `Embeddings endpoint returned ${data?.length} vectors for ${input.length} inputs`,
+    );
+  }
+  return data.toSorted((a, b) => (a.index ?? 0) - (b.index ?? 0))
+    .map((d) => d.embedding);
+}
+
+// Wraps fetch so that "local/<model>" text objects in request bodies are
+// replaced by vectors from an OpenAI-compatible embeddings endpoint.
+export function withLocalEmbeddings(
+  cfg: EmbeddingsConfig,
+  fetchImpl: typeof fetch = fetch,
+): typeof fetch {
+  return async (input, init) => {
+    if (
+      typeof init?.body !== "string" || !init.body.includes(`"${LOCAL_PREFIX}`)
+    ) {
+      return fetchImpl(input, init);
+    }
+    const json = JSON.parse(init.body);
+    const refs: DocRef[] = [];
+    collectLocalDocs(json, refs);
+    for (const model of new Set(refs.map((r) => r.model))) {
+      const group = refs.filter((r) => r.model === model);
+      const vectors = await embed(
+        cfg,
+        fetchImpl,
+        model,
+        group.map((r) => r.text),
+      );
+      group.forEach((r, i) => {
+        r.parent[r.key] = vectors[i];
+      });
+    }
+    return fetchImpl(input, { ...init, body: JSON.stringify(json) });
+  };
+}
+
 export interface ServerConfig {
   spec: string;
   url: string;
@@ -234,6 +338,7 @@ export interface ServerConfig {
   enableWrites: boolean;
   auth?: AuthConfig;
   cloudInferenceExt?: QCIExternConfig;
+  embeddings?: EmbeddingsConfig;
 }
 
 export function resolveHeaders(cfg: ServerConfig): Record<string, string> {
@@ -285,6 +390,7 @@ export function buildServer(cfg: ServerConfig) {
     client: {
       baseUrl: cfg.url,
       headers,
+      fetch: cfg.embeddings ? withLocalEmbeddings(cfg.embeddings) : undefined,
     },
     routeMaps: buildRouteMaps(cfg.enableWrites),
     // Called for every component that gets registered, so it doubles as the
@@ -310,6 +416,8 @@ async function main() {
       "jwks",
       "public-url",
       "issuer",
+      "embeddings-url",
+      "embeddings-api-key",
     ],
     collect: ["audience", "auth-server"],
     boolean: [
@@ -373,6 +481,29 @@ async function main() {
     );
   }
 
+  const embeddingsUrl = args["embeddings-url"] ?? env("QDRANT_EMBEDDINGS_URL");
+  if (
+    embeddingsUrl &&
+    !(URL.canParse(embeddingsUrl) && /^https?:/.test(embeddingsUrl))
+  ) {
+    throw new Error(
+      `--embeddings-url must be an http(s) URL, got "${embeddingsUrl}"`,
+    );
+  }
+  const embeddings = embeddingsUrl
+    ? {
+      url: embeddingsUrl,
+      apiKey: args["embeddings-api-key"] ?? env("QDRANT_EMBEDDINGS_API_KEY"),
+    }
+    : undefined;
+  if (embeddings && !args.list) {
+    console.error(
+      `embedding "${LOCAL_PREFIX}<model>" texts via ${
+        new URL(embeddings.url).host
+      }`,
+    );
+  }
+
   const host = args.host ?? "127.0.0.1";
   const port = Number(args.port ?? 8000);
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
@@ -421,6 +552,7 @@ async function main() {
     enableWrites,
     auth,
     cloudInferenceExt: qciExtern,
+    embeddings,
   });
 
   if (args.list) {
