@@ -26,10 +26,10 @@ Set `QDRANT_MCP_REPO` to install from a fork.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/qdrant-labs/qdrant-data-mcp/main/scripts/install.sh \
-  | VERSION=v1.20.0-server.1 INSTALL_DIR=/usr/local/bin sh
+  | VERSION=v1.20.0-server.2 INSTALL_DIR=/usr/local/bin sh
 ```
 
-Versions look like `v1.20.0-server.1`: the Qdrant version the server targets,
+Versions look like `v1.20.0-server.2`: the Qdrant version the server targets,
 then the server's own revision. The default OpenAPI spec is the one for that
 Qdrant version.
 
@@ -71,7 +71,7 @@ docker run --rm -p 127.0.0.1:8000:8000 -e QDRANT_URL -e QDRANT_API_KEY \
 
 Binding to `0.0.0.0` inside the container is fine as long as you publish the
 port on `127.0.0.1` only, or turn on auth. To pin a release, add its tag, for
-example `ghcr.io/qdrant-labs/qdrant-data-mcp:v1.20.0-server.1`. The tag
+example `ghcr.io/qdrant-labs/qdrant-data-mcp:v1.20.0-server.2`. The tag
 `v1.20.0` always points at the latest server revision for that Qdrant version.
 
 For a self-hosted Qdrant on your machine, use
@@ -115,16 +115,18 @@ options are resolved.
 Every option has an environment variable fallback, so an MCP client can pass
 either. A flag always wins over its variable.
 
-| Flag                       | Environment Variable      | Description                                                                                                  |
-| -------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `--url`                    | `QDRANT_URL`              | Qdrant REST URL. Defaults to `http://localhost:6333`.                                                        |
-| `--api-key`                | `QDRANT_API_KEY`          | Sent to Qdrant as the `api-key` header.                                                                      |
-| `--openapi`                | `QDRANT_OPENAPI`          | Path or URL of the OpenAPI spec. Defaults to the spec on GitHub corresponding to the current server version. |
-| `--enable-writes`          | `QDRANT_WRITES_ENABLED=1` | Expose tools that insert, update, or delete.                                                                 |
-| `--qci-external-providers` | none                      | Send external embedding provider keys from the environment to Qdrant Cloud Inference. See below.             |
-| `--http`                   | none                      | Serve streamable HTTP instead of stdio.                                                                      |
-| `--host`, `--port`         | none                      | HTTP bind address. Default `127.0.0.1:8000`.                                                                 |
-| `--list`                   | none                      | Print the exposed tools and exit.                                                                            |
+| Flag                       | Environment Variable        | Description                                                                                                  |
+| -------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `--url`                    | `QDRANT_URL`                | Qdrant REST URL. Defaults to `http://localhost:6333`.                                                        |
+| `--api-key`                | `QDRANT_API_KEY`            | Sent to Qdrant as the `api-key` header.                                                                      |
+| `--openapi`                | `QDRANT_OPENAPI`            | Path or URL of the OpenAPI spec. Defaults to the spec on GitHub corresponding to the current server version. |
+| `--enable-writes`          | `QDRANT_WRITES_ENABLED=1`   | Expose tools that insert, update, or delete.                                                                 |
+| `--qci-external-providers` | none                        | Send external embedding provider keys from the environment to Qdrant Cloud Inference. See below.             |
+| `--embeddings-url`         | `QDRANT_EMBEDDINGS_URL`     | OpenAI-compatible embeddings endpoint for `local/<model>` texts. See below.                                  |
+| `--embeddings-api-key`     | `QDRANT_EMBEDDINGS_API_KEY` | Bearer token for that endpoint.                                                                              |
+| `--http`                   | none                        | Serve streamable HTTP instead of stdio.                                                                      |
+| `--host`, `--port`         | none                        | HTTP bind address. Default `127.0.0.1:8000`.                                                                 |
+| `--list`                   | none                        | Print the exposed tools and exit.                                                                            |
 
 ### External Embedding Providers
 
@@ -150,6 +152,77 @@ An upsert or query can then use a model such as
   that reason `--url` must use `https`, except for `localhost`.
 - Startup prints which providers are forwarded and to which host. It never
   prints the key values.
+
+### Embeddings for Self-Hosted Qdrant
+
+Qdrant Cloud Inference isn't available on self-hosted Qdrant. To get the same
+`{"text": ..., "model": ...}` convenience there, point `--embeddings-url` at any
+OpenAI-compatible embeddings endpoint, such as Ollama, LM Studio, vLLM, or Text
+Embeddings Inference. Use a model named `local/<model>`, and the server replaces
+the text with a vector from that endpoint before the request reaches Qdrant.
+Your MCP client never sees the vectors.
+
+```sh
+ollama pull nomic-embed-text
+claude mcp add qdrant-data -- qdrant-data-mcp --enable-writes --embeddings-url http://localhost:11434/v1
+```
+
+The collection's vector size must match the model's output size. Run
+`ollama show nomic-embed-text` to see its embedding length, which is 768. Then
+create a collection, and give the model name as `local/nomic-embed-text`
+wherever a vector goes:
+
+```json
+{
+  "collection_name": "articles",
+  "vectors": { "dense": { "size": 768, "distance": "Cosine" } }
+}
+```
+
+An `upsert_points` call, with the text where a vector would normally be:
+
+```json
+{
+  "collection_name": "articles",
+  "body": {
+    "points": [{
+      "id": 1,
+      "payload": { "text": "Recipe for baking chocolate chip cookies" },
+      "vector": {
+        "dense": {
+          "text": "Recipe for baking chocolate chip cookies",
+          "model": "local/nomic-embed-text"
+        }
+      }
+    }]
+  }
+}
+```
+
+And a `query_points` call:
+
+```json
+{
+  "collection_name": "articles",
+  "using": "dense",
+  "query": {
+    "text": "a sweet dessert made with chocolate",
+    "model": "local/nomic-embed-text"
+  },
+  "limit": 3
+}
+```
+
+Things to know:
+
+- Only models starting with `local/` are handled this way. Any other model goes
+  to Qdrant unchanged, so Cloud Inference keeps working.
+- The prefix is removed before the call, so Ollama receives `nomic-embed-text`.
+- Unlike Cloud Inference, the server doesn't add the query or passage prefixes
+  some models expect. Put them in the text yourself.
+- If the endpoint fails, the tool call fails and nothing is sent to Qdrant.
+- Your texts go to the endpoint, and the API key is sent as a bearer token, so
+  use `https` for any remote endpoint.
 
 ## Which Tools Are Exposed
 
@@ -246,7 +319,7 @@ A few behaviors to know about:
 - fastmcp-ts doesn't forward inbound HTTP headers to the upstream API, so Qdrant
   credentials come from `--api-key`, not from the calling client.
 - The default spec is the one for the Qdrant version in the server's version
-  (`v1.20.0` for `v1.20.0-server.1`). Pass `--openapi` to match a different
+  (`v1.20.0` for `v1.20.0-server.2`). Pass `--openapi` to match a different
   Qdrant version.
 - The macOS and Windows binaries are cross-compiled on Linux and aren't signed.
   macOS may block an unsigned binary on first run.

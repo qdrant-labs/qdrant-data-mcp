@@ -1,5 +1,5 @@
 {
-  "version": "1.20.0-server.1",
+  "version": "1.20.0-server.2",
   "tasks": {
     "dev": "deno run --watch --allow-net --allow-env --allow-read main.ts",
     "start": "deno run --allow-net --allow-env --allow-read main.ts",
