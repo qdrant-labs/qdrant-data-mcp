@@ -26,8 +26,12 @@ Set `QDRANT_MCP_REPO` to install from a fork.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/qdrant-labs/qdrant-data-mcp/main/scripts/install.sh \
-  | VERSION=v1.20.0 INSTALL_DIR=/usr/local/bin sh
+  | VERSION=v1.20.0-server.1 INSTALL_DIR=/usr/local/bin sh
 ```
+
+Versions look like `v1.20.0-server.1`: the Qdrant version the server targets,
+then the server's own revision. The default OpenAPI spec is the one for that
+Qdrant version.
 
 On Windows, download the `.exe.gz` from the
 [releases page](https://github.com/qdrant-labs/qdrant-data-mcp/releases).
@@ -67,7 +71,8 @@ docker run --rm -p 127.0.0.1:8000:8000 -e QDRANT_URL -e QDRANT_API_KEY \
 
 Binding to `0.0.0.0` inside the container is fine as long as you publish the
 port on `127.0.0.1` only, or turn on auth. To pin a release, add its tag, for
-example `ghcr.io/qdrant-labs/qdrant-data-mcp:v1.20.0`.
+example `ghcr.io/qdrant-labs/qdrant-data-mcp:v1.20.0-server.1`. The tag
+`v1.20.0` always points at the latest server revision for that Qdrant version.
 
 For a self-hosted Qdrant on your machine, use
 `--url http://host.docker.internal:6333` instead, because inside a container
@@ -110,15 +115,41 @@ options are resolved.
 Every option has an environment variable fallback, so an MCP client can pass
 either. A flag always wins over its variable.
 
-| Flag               | Environment Variable      | Description                                                                                                  |
-| ------------------ | ------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `--url`            | `QDRANT_URL`              | Qdrant REST URL. Defaults to `http://localhost:6333`.                                                        |
-| `--api-key`        | `QDRANT_API_KEY`          | Sent to Qdrant as the `api-key` header.                                                                      |
-| `--openapi`        | `QDRANT_OPENAPI`          | Path or URL of the OpenAPI spec. Defaults to the spec on GitHub corresponding to the current server version. |
-| `--enable-writes`  | `QDRANT_WRITES_ENABLED=1` | Expose tools that insert, update, or delete.                                                                 |
-| `--http`           | none                      | Serve streamable HTTP instead of stdio.                                                                      |
-| `--host`, `--port` | none                      | HTTP bind address. Default `127.0.0.1:8000`.                                                                 |
-| `--list`           | none                      | Print the exposed tools and exit.                                                                            |
+| Flag                       | Environment Variable      | Description                                                                                                  |
+| -------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `--url`                    | `QDRANT_URL`              | Qdrant REST URL. Defaults to `http://localhost:6333`.                                                        |
+| `--api-key`                | `QDRANT_API_KEY`          | Sent to Qdrant as the `api-key` header.                                                                      |
+| `--openapi`                | `QDRANT_OPENAPI`          | Path or URL of the OpenAPI spec. Defaults to the spec on GitHub corresponding to the current server version. |
+| `--enable-writes`          | `QDRANT_WRITES_ENABLED=1` | Expose tools that insert, update, or delete.                                                                 |
+| `--qci-external-providers` | none                      | Send external embedding provider keys from the environment to Qdrant Cloud Inference. See below.             |
+| `--http`                   | none                      | Serve streamable HTTP instead of stdio.                                                                      |
+| `--host`, `--port`         | none                      | HTTP bind address. Default `127.0.0.1:8000`.                                                                 |
+| `--list`                   | none                      | Print the exposed tools and exit.                                                                            |
+
+### External Embedding Providers
+
+Qdrant Cloud Inference can call OpenAI, Cohere, Jina AI, and OpenRouter models
+for you, but it needs your key for that provider on every request, as a header.
+The MCP tools can't set headers, so `--qci-external-providers` does it for you:
+it reads whichever of `OPENAI_API_KEY`, `COHERE_API_KEY`, `JINA_API_KEY`, and
+`OPENROUTER_API_KEY` are set and sends them as the `openai-api-key`,
+`cohere-api-key`, `jina-api-key`, and `openrouter-api-key` headers. The keys
+then never pass through the conversation with your MCP client.
+
+```sh
+export OPENROUTER_API_KEY=sk-or-...
+qdrant-data-mcp --url https://xyz-example.cloud.qdrant.io:6333 --qci-external-providers
+```
+
+An upsert or query can then use a model such as
+`openrouter/google/gemini-embedding-2` with no `options` object. Things to know:
+
+- The flag fails at startup if none of the four variables is set, so a typo
+  doesn't turn into a silent no-op.
+- The keys are sent on every request to Qdrant, not only inference calls. For
+  that reason `--url` must use `https`, except for `localhost`.
+- Startup prints which providers are forwarded and to which host. It never
+  prints the key values.
 
 ## Which Tools Are Exposed
 
@@ -214,7 +245,8 @@ A few behaviors to know about:
   `delete_points`. Enable writes only against data you can lose.
 - fastmcp-ts doesn't forward inbound HTTP headers to the upstream API, so Qdrant
   credentials come from `--api-key`, not from the calling client.
-- The default spec is pinned to Qdrant v1.20.0. Pass `--openapi` to match a
-  different server version.
+- The default spec is the one for the Qdrant version in the server's version
+  (`v1.20.0` for `v1.20.0-server.1`). Pass `--openapi` to match a different
+  Qdrant version.
 - The macOS and Windows binaries are cross-compiled on Linux and aren't signed.
   macOS may block an unsigned binary on first run.

@@ -51,6 +51,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve version tags
+        id: version
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          echo "qdrant=${TAG%%-*}" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-server\.[0-9]+$ ]]; then
+            echo "stable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "stable=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
@@ -60,7 +72,8 @@ jobs:
             type=ref,event=branch,enable=${{ github.event_name != 'workflow_dispatch' }}
             type=ref,event=tag
             type=raw,value=${{ inputs.tag || github.ref_name }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' && !contains(inputs.tag, '-') }}
+            type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' && steps.version.outputs.stable == 'true' }}
+            type=raw,value=${{ steps.version.outputs.qdrant }},enable=${{ github.event_name == 'workflow_dispatch' && steps.version.outputs.stable == 'true' }}
 
       - name: Build and push Docker image
         id: build-and-push
