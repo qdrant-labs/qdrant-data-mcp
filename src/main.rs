@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
-use actix_web::{App, HttpServer, web};
+use actix_cors::Cors;
+use actix_web::{App, HttpServer, middleware::from_fn, web};
 use clap::Parser;
 use qdrant_data_mcp::{
-    QdrantServer, ServerOptions, VERSION, build_server,
+    QdrantServer, ServerOptions, VERSION,
+    auth::{self, Auth, AuthInputs},
+    build_server,
     cli::Cli,
     embeddings::{EmbeddingsConfig, LOCAL_PREFIX},
     load_spec, qci,
@@ -34,6 +37,20 @@ async fn run() -> Result<(), String> {
     let base_url = Url::parse(&cli.url)
         .map_err(|e| format!("--url must be a valid URL, got \"{}\": {e}", cli.url))?;
     let embeddings = EmbeddingsConfig::resolve(cli.embeddings_url, cli.embeddings_api_key)?;
+    let auth_config = auth::resolve(AuthInputs {
+        jwks: cli.jwks,
+        public_url: cli.public_url,
+        auth_servers: cli.auth_server,
+        issuer: cli.issuer,
+        audience: cli.audience,
+    })?;
+    if auth_config.is_some() && !cli.http && !cli.list {
+        return Err(
+            "Auth options only apply to the HTTP transport. Add --http, or remove the \
+            auth options (and unset AUTH_* env vars) to run over stdio."
+                .to_string(),
+        );
+    }
     let provider_keys = if cli.qci_external_providers && !cli.list {
         qci::resolve(&base_url, |name| std::env::var(name).ok())?
     } else {
@@ -56,14 +73,32 @@ async fn run() -> Result<(), String> {
             );
         }
         if cli.http {
-            let loopback = matches!(cli.host.as_str(), "127.0.0.1" | "::1" | "localhost");
-            if loopback {
-                eprintln!("warning: HTTP server is running WITHOUT auth (loopback only).");
-            } else {
-                eprintln!(
-                    "warning: HTTP server on {} is exposed WITHOUT auth.",
+            match &auth_config {
+                None if matches!(cli.host.as_str(), "127.0.0.1" | "::1" | "localhost") => {
+                    eprintln!("warning: HTTP server is running WITHOUT auth (loopback only).")
+                }
+                None => eprintln!(
+                    "warning: HTTP server on {} is exposed WITHOUT auth. Set --jwks, \
+                     --public-url and --auth-server.",
                     cli.host
-                );
+                ),
+                Some(config) => {
+                    if config.issuer.is_none() {
+                        eprintln!(
+                            "warning: no --issuer set, tokens from any issuer sharing these keys are accepted."
+                        );
+                    }
+                    if config.audience.is_empty() {
+                        eprintln!(
+                            "warning: no --audience set, tokens minted for other services are accepted."
+                        );
+                    }
+                    eprintln!(
+                        "auth: verifying JWTs against {}; discovery document at {}",
+                        config.jwks_uri,
+                        config.metadata_url()
+                    );
+                }
             }
         }
     }
@@ -91,7 +126,10 @@ async fn run() -> Result<(), String> {
     }
 
     if cli.http {
-        serve_http(server, &cli.host, cli.port).await
+        let auth = auth_config
+            .map(|config| Auth::new(config).map(web::Data::new))
+            .transpose()?;
+        serve_http(server, &cli.host, cli.port, auth).await
     } else {
         serve_stdio(server).await
     }
@@ -120,14 +158,40 @@ async fn serve_stdio(server: QdrantServer) -> Result<(), String> {
     Ok(())
 }
 
-async fn serve_http(server: QdrantServer, host: &str, port: u16) -> Result<(), String> {
+async fn serve_http(
+    server: QdrantServer,
+    host: &str,
+    port: u16,
+    auth: Option<web::Data<Auth>>,
+) -> Result<(), String> {
     let service = StreamableHttpService::builder()
         .service_factory(Arc::new(move || Ok(server.clone())))
         .session_manager(LocalSessionManager::default().into())
         .stateful_mode(true)
         .build();
     let http_server = HttpServer::new(move || {
-        App::new().service(web::scope("/mcp").service(service.clone().scope()))
+        App::new()
+            .configure(|cfg| {
+                if let Some(auth) = &auth {
+                    cfg.app_data(auth.clone()).route(
+                        "/.well-known/oauth-protected-resource/mcp",
+                        web::get().to(auth::metadata),
+                    );
+                }
+            })
+            .service(
+                web::scope("/mcp")
+                    .wrap(from_fn(auth::require_token))
+                    .service(service.clone().scope()),
+            )
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allow_any_method()
+                    .allow_any_header()
+                    .expose_any_header()
+                    .max_age(3600),
+            )
     })
     .bind((host, port))
     .map_err(|e| format!("Could not bind {host}:{port}: {e}"))?

@@ -8,7 +8,7 @@ hand-written handlers. Cluster, snapshot, and health endpoints are filtered out,
 and write operations are off unless you turn them on.
 
 It runs on stdio or streamable HTTP, and ships as a single binary of about
-15 MB. HTTP authentication isn't supported yet (see
+15 MB. The HTTP transport can be protected with bearer token auth (see
 [Securing the HTTP Server](#securing-the-http-server)).
 
 ## Install
@@ -72,7 +72,7 @@ docker run --rm -p 127.0.0.1:8000:8000 -e QDRANT_URL -e QDRANT_API_KEY \
 ```
 
 Binding to `0.0.0.0` inside the container is fine as long as you publish the
-port on `127.0.0.1` only, because the HTTP server has no authentication. To pin
+port on `127.0.0.1` only, or turn on auth. To pin
 a release, add its tag, for example
 `ghcr.io/qdrant-labs/qdrant-data-mcp:v1.20.0-server.3`. The tag `v1.20.0` always
 points at the latest server revision for that Qdrant version.
@@ -114,7 +114,8 @@ cargo test
 The tests don't need a network or a Qdrant instance. They cover which
 operations become tools in read-only and write modes, how recursive schemas are
 broken and repeated ones are shared, how headers and provider keys are built,
-how `local/` texts are rewritten, and how options and versions are parsed.
+how `local/` texts are rewritten, how bearer tokens are verified, and how
+options and versions are parsed.
 
 The server's version comes from `Cargo.toml`, so bumping it there also changes
 which Qdrant spec is fetched by default.
@@ -304,11 +305,47 @@ claude mcp add --transport http qdrant-data http://127.0.0.1:8000/mcp
 
 ## Securing the HTTP Server
 
-HTTP authentication isn't supported in this version. The server accepts any
-request, and it warns at startup about that. Keep `--http` on `127.0.0.1`, and
-if you need to reach it from elsewhere, put a reverse proxy that handles
-authentication in front of it. Stdio isn't affected, since the client starts the
-process itself.
+With `--http` the server can verify JWT bearer tokens against a JWKS endpoint
+and publish protected resource metadata (RFC 9728), so MCP clients can discover
+your authorization server on their own. Setting any auth option turns auth on.
+
+```sh
+qdrant-data-mcp --http \
+  --jwks https://idp.example.com/.well-known/jwks.json \
+  --issuer https://idp.example.com/ \
+  --audience http://127.0.0.1:8000/mcp \
+  --auth-server https://idp.example.com \
+  --public-url http://127.0.0.1:8000
+```
+
+| Flag            | Environment Variable         | Description                                                                                |
+| --------------- | ---------------------------- | ------------------------------------------------------------------------------------------ |
+| `--jwks`        | `AUTH_JWKS_URI`              | JWKS endpoint used to verify token signatures. Required.                                   |
+| `--public-url`  | `AUTH_PUBLIC_URL`            | The URL clients use to reach this server, without `/mcp`. Required.                        |
+| `--auth-server` | `AUTH_AUTHORIZATION_SERVERS` | Issuer URL of an authorization server. Repeat the flag or comma-separate. Required.        |
+| `--issuer`      | `AUTH_ISSUER`                | Required token issuer. Must match the token's `iss` exactly, including any trailing slash. |
+| `--audience`    | `AUTH_AUDIENCE`              | Required token audience. Repeat or comma-separate.                                         |
+
+Requests to `/mcp` without a valid token get a `401` with a `WWW-Authenticate`
+header that points at `/.well-known/oauth-protected-resource/mcp`. That
+document needs no token. A few behaviors to know about:
+
+- A partial auth configuration is an error. The server never falls back to
+  running unauthenticated.
+- Auth options without `--http` are also an error. A leftover `AUTH_*` variable
+  will stop a stdio run.
+- Without `--issuer` and `--audience`, the server warns at startup, because it
+  would accept tokens from any issuer sharing the keys or minted for other
+  services.
+- Clients that follow the MCP authorization flow request a token for the MCP URL
+  itself (the RFC 8707 `resource` parameter), so the audience is usually your
+  public URL plus `/mcp`.
+- Only asymmetric signatures are accepted (RS, PS, ES, and EdDSA). Tokens must
+  have an `exp` and a `kid`, and the signing keys are cached and refetched when
+  an unknown `kid` shows up, at most every 30 seconds.
+- Only JWT access tokens work. If your provider issues opaque tokens, configure
+  it to issue JWTs for this audience.
+- Run HTTP without auth only on loopback.
 
 ## Limitations
 

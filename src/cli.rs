@@ -37,6 +37,26 @@ pub struct Cli {
     #[arg(long, env = "QDRANT_EMBEDDINGS_API_KEY", hide_env_values = true)]
     pub embeddings_api_key: Option<String>,
 
+    /// JWKS endpoint that signs the bearer tokens. Setting any auth option turns on HTTP auth
+    #[arg(long, env = "AUTH_JWKS_URI")]
+    pub jwks: Option<String>,
+
+    /// The URL clients use to reach this server, without /mcp
+    #[arg(long, env = "AUTH_PUBLIC_URL")]
+    pub public_url: Option<String>,
+
+    /// Issuer URL of an authorization server for clients to use (repeat or comma-separate)
+    #[arg(long, env = "AUTH_AUTHORIZATION_SERVERS", value_delimiter = ',')]
+    pub auth_server: Vec<String>,
+
+    /// Required token issuer, matched exactly (recommended)
+    #[arg(long, env = "AUTH_ISSUER")]
+    pub issuer: Option<String>,
+
+    /// Required token audience (repeat or comma-separate, recommended)
+    #[arg(long, env = "AUTH_AUDIENCE", value_delimiter = ',')]
+    pub audience: Vec<String>,
+
     /// Serve streamable HTTP instead of stdio
     #[arg(long)]
     pub http: bool,
