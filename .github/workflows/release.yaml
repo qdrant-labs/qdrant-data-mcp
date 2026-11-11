@@ -5,20 +5,16 @@ on:
     branches: [main]
 
 jobs:
-  publish:
-    name: Publish
+  version:
+    name: Version
     runs-on: ubuntu-latest
     if: "startsWith(github.event.head_commit.message, 'release: ')"
     outputs:
       version: ${{ steps.version.outputs.version }}
-    permissions:
-      contents: write # to create the tag and GitHub release
-      actions: write # to dispatch the Docker image build
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Extract version
         id: version
@@ -36,9 +32,9 @@ jobs:
             exit 1
           fi
 
-          file_version="$(jq -r .version deno.json)"
+          file_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           if [[ "v$file_version" != "$version" ]]; then
-            echo "Version '$version' does not match deno.json ('$file_version')" >&2
+            echo "Version '$version' does not match Cargo.toml ('$file_version')" >&2
             exit 1
           fi
 
@@ -52,29 +48,88 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
-      - name: Install Deno
-        uses: denoland/setup-deno@v2
+  # Each binary builds natively on its own OS. The Linux ones use the oldest
+  # runner images so they work on older glibc versions.
+  build:
+    name: Build ${{ matrix.target }}
+    needs: version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            ext: .exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          deno-version: v2.x
+          targets: ${{ matrix.target }}
 
-      - name: Build binaries
-        run: ./scripts/build.sh
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
-      - name: Compress binaries and write checksums
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Compress
+        shell: bash
         run: |
-          gzip -9 dist/*
-          cd dist && sha256sum * > checksums.txt
+          mkdir dist
+          gzip -9 -c "target/${{ matrix.target }}/release/qdrant-data-mcp${{ matrix.ext }}" \
+            > "dist/qdrant-data-mcp-${{ matrix.target }}${{ matrix.ext }}.gz"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to create the tag and GitHub release
+      actions: write # to dispatch the Docker image build
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Write checksums
+        run: cd dist && sha256sum * > checksums.txt
 
       - name: Create tag and GitHub Release
         uses: ncipollo/release-action@v1
         with:
-          tag: ${{ steps.version.outputs.version }}
+          tag: ${{ needs.version.outputs.version }}
           commit: ${{ github.sha }}
-          prerelease: ${{ steps.version.outputs.prerelease }}
+          prerelease: ${{ needs.version.outputs.prerelease }}
           generateReleaseNotes: true
           artifacts: "dist/*"
 
       - name: Dispatch Docker image build
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run docker-image.yaml -f tag=${{ steps.version.outputs.version }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run docker-image.yaml -f tag=${{ needs.version.outputs.version }}

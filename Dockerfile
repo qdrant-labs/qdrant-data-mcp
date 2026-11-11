@@ -1,13 +1,15 @@
-FROM denoland/deno:2.9.6 AS build
+FROM rust:1.99-bookworm AS build
 WORKDIR /app
-COPY deno.json deno.lock main.ts ./
-RUN deno compile --allow-env --allow-read --allow-net -o qdrant-data-mcp main.ts
 
-FROM debian:bookworm-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --no-create-home mcp
-COPY --from=build /app/qdrant-data-mcp /usr/local/bin/qdrant-data-mcp
-USER mcp
+# Build the dependencies first, so source changes don't rebuild them
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && touch src/lib.rs && echo "fn main() {}" > src/main.rs \
+    && cargo build --release \
+    && rm -r src
+
+COPY src ./src
+RUN touch src/lib.rs src/main.rs && cargo build --release
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=build /app/target/release/qdrant-data-mcp /usr/local/bin/qdrant-data-mcp
 ENTRYPOINT ["qdrant-data-mcp"]

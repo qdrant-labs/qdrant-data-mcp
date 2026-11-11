@@ -1,14 +1,15 @@
 # Qdrant Data MCP
 
 A prototype Model Context Protocol (MCP) server that exposes Qdrant's data
-operations as tools. It's generated at startup from Qdrant's OpenAPI
-specification with
-[fastmcp-ts](https://fastmcp-ts.docs.prefect.io/servers/openapi/), so there are
-no hand-written handlers. Cluster, snapshot, and health endpoints are filtered
-out, and write operations are off unless you turn them on.
+operations as tools. It's written in Rust and generated at startup from
+Qdrant's OpenAPI specification with
+[rmcp-openapi](https://github.com/lx-industries/rmcp-openapi), so there are no
+hand-written handlers. Cluster, snapshot, and health endpoints are filtered out,
+and write operations are off unless you turn them on.
 
-It runs on stdio or streamable HTTP, optionally protected with bearer token
-auth, and compiles to a single binary with Deno.
+It runs on stdio or streamable HTTP, and ships as a single binary of about
+15 MB. HTTP authentication isn't supported yet (see
+[Securing the HTTP Server](#securing-the-http-server)).
 
 ## Install
 
@@ -26,10 +27,10 @@ Set `QDRANT_MCP_REPO` to install from a fork.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/qdrant-labs/qdrant-data-mcp/main/scripts/install.sh \
-  | VERSION=v1.20.0-server.2 INSTALL_DIR=/usr/local/bin sh
+  | VERSION=v1.20.0-server.3 INSTALL_DIR=/usr/local/bin sh
 ```
 
-Versions look like `v1.20.0-server.2`: the Qdrant version the server targets,
+Versions look like `v1.20.0-server.3`: the Qdrant version the server targets,
 then the server's own revision. The default OpenAPI spec is the one for that
 Qdrant version.
 
@@ -53,9 +54,10 @@ MCP server version.
 
 ## Docker
 
-The image is published to the GitHub Container Registry. Pass your Qdrant Cloud
-URL and API key as environment variables. A bare `-e QDRANT_API_KEY` forwards
-the value from your shell, so the key never appears in the command.
+The image is published to the GitHub Container Registry for linux/amd64 and
+linux/arm64. Pass your Qdrant Cloud URL and API key as environment variables. A
+bare `-e QDRANT_API_KEY` forwards the value from your shell, so the key never
+appears in the command.
 
 ```sh
 export QDRANT_URL=https://xyz-example.cloud.qdrant.io:6333
@@ -70,9 +72,10 @@ docker run --rm -p 127.0.0.1:8000:8000 -e QDRANT_URL -e QDRANT_API_KEY \
 ```
 
 Binding to `0.0.0.0` inside the container is fine as long as you publish the
-port on `127.0.0.1` only, or turn on auth. To pin a release, add its tag, for
-example `ghcr.io/qdrant-labs/qdrant-data-mcp:v1.20.0-server.2`. The tag
-`v1.20.0` always points at the latest server revision for that Qdrant version.
+port on `127.0.0.1` only, because the HTTP server has no authentication. To pin
+a release, add its tag, for example
+`ghcr.io/qdrant-labs/qdrant-data-mcp:v1.20.0-server.3`. The tag `v1.20.0` always
+points at the latest server revision for that Qdrant version.
 
 For a self-hosted Qdrant on your machine, use
 `--url http://host.docker.internal:6333` instead, because inside a container
@@ -80,35 +83,41 @@ For a self-hosted Qdrant on your machine, use
 `--add-host host.docker.internal:host-gateway` to `docker run`.
 
 To build the image yourself, run `docker build -t qdrant-data-mcp .` and use
-that name in place of the registry path.
+that name in place of the registry path. The image is based on a distroless
+runtime, so it has no shell.
 
 ## Development Setup
 
-To build and run from source you need [Deno](https://deno.com) 2.x and a running
-Qdrant instance.
+To build and run from source you need [Rust](https://rustup.rs) (a recent stable
+toolchain, since the crate uses the 2024 edition) and a running Qdrant instance.
 
 ```sh
 git clone https://github.com/qdrant-labs/qdrant-data-mcp.git
 cd qdrant-data-mcp
 
-deno task start --list                # print the tools the server would expose
-deno task start                       # run over stdio, read-only
-deno task start --http --port 8000    # run over streamable HTTP
-deno task dev                         # same as start, with --watch
+cargo run -- --list                  # print the tools the server would expose
+cargo run                            # run over stdio, read-only
+cargo run -- --http --port 8000      # run over streamable HTTP
+cargo build --release                # build target/release/qdrant-data-mcp
 ```
 
-Everything after the task name goes to the server, so all the options in the
-next section work the same way from source and from the binary. To check your
+Everything after `--` goes to the server, so all the options in the next
+section work the same way from source and from the binary. To check your
 changes:
 
 ```sh
-deno check main.ts
-deno test --allow-net --allow-env --allow-read
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
-The tests build servers from a small inline spec and check which tools survive
-in read-only and write modes, how the `writer` tag is applied, and how auth
-options are resolved.
+The tests don't need a network or a Qdrant instance. They cover which
+operations become tools in read-only and write modes, how recursive schemas are
+broken and repeated ones are shared, how headers and provider keys are built,
+how `local/` texts are rewritten, and how options and versions are parsed.
+
+The server's version comes from `Cargo.toml`, so bumping it there also changes
+which Qdrant spec is fetched by default.
 
 ## Options
 
@@ -127,6 +136,10 @@ either. A flag always wins over its variable.
 | `--http`                   | none                        | Serve streamable HTTP instead of stdio.                                                                      |
 | `--host`, `--port`         | none                        | HTTP bind address. Default `127.0.0.1:8000`.                                                                 |
 | `--list`                   | none                        | Print the exposed tools and exit.                                                                            |
+| `-v`, `--version`          | none                        | Print the version and exit.                                                                                  |
+
+Logs go to stderr, and only errors are shown by default. Set `RUST_LOG=info` to
+see more.
 
 ### External Embedding Providers
 
@@ -150,8 +163,9 @@ An upsert or query can then use a model such as
   doesn't turn into a silent no-op.
 - The keys are sent on every request to Qdrant, not only inference calls. For
   that reason `--url` must use `https`, except for `localhost`.
-- Startup prints which providers are forwarded and to which host. It never
-  prints the key values.
+- Every provider key in the environment is forwarded, whether or not you use
+  that provider. Startup prints which providers are forwarded and to which
+  host. It never prints the key values.
 
 ### Embeddings for Self-Hosted Qdrant
 
@@ -170,12 +184,14 @@ claude mcp add qdrant-data -- qdrant-data-mcp --enable-writes --embeddings-url h
 The collection's vector size must match the model's output size. Run
 `ollama show nomic-embed-text` to see its embedding length, which is 768. Then
 create a collection, and give the model name as `local/nomic-embed-text`
-wherever a vector goes:
+wherever a vector goes. A `create_collection` call:
 
 ```json
 {
   "collection_name": "articles",
-  "vectors": { "dense": { "size": 768, "distance": "Cosine" } }
+  "request_body": {
+    "vectors": { "dense": { "size": 768, "distance": "Cosine" } }
+  }
 }
 ```
 
@@ -184,7 +200,7 @@ An `upsert_points` call, with the text where a vector would normally be:
 ```json
 {
   "collection_name": "articles",
-  "body": {
+  "request_body": {
     "points": [{
       "id": 1,
       "payload": { "text": "Recipe for baking chocolate chip cookies" },
@@ -204,12 +220,14 @@ And a `query_points` call:
 ```json
 {
   "collection_name": "articles",
-  "using": "dense",
-  "query": {
-    "text": "a sweet dessert made with chocolate",
-    "model": "local/nomic-embed-text"
-  },
-  "limit": 3
+  "request_body": {
+    "using": "dense",
+    "query": {
+      "text": "a sweet dessert made with chocolate",
+      "model": "local/nomic-embed-text"
+    },
+    "limit": 3
+  }
 }
 ```
 
@@ -226,9 +244,11 @@ Things to know:
 
 ## Which Tools Are Exposed
 
-Every tool is tagged `reader` or `writer`. Readers are always on. Writers only
-exist when you pass `--enable-writes`, so by default you get 16 tools, and with
-writes you get 33.
+Every tool is either a reader or a writer, and `--list` shows which. Readers are
+always on. Writers only exist when you pass `--enable-writes`, so by default you
+get 16 tools, and with writes you get 33. When writes are off, the writer
+operations are removed from the spec before the tools are generated, so those
+tools don't exist at all.
 
 **Reader tools (16):**
 
@@ -247,14 +267,25 @@ writes you get 33.
 | Points               | `upsert_points`, `delete_points`, `batch_update`                                                          |
 | Vectors and payloads | `update_vectors`, `delete_vectors`, `set_payload`, `overwrite_payload`, `delete_payload`, `clear_payload` |
 
+Qdrant uses POST for queries that take a body, so `get_points`, `scroll_points`,
+`count_points`, `facet`, and the query and search matrix tools are readers even
+though they're POST requests.
+
 Cluster, snapshot, and health endpoints are left out (the Distributed, Service,
-Snapshots, Beta, and Quotas groups in the OpenAPI spec). The route maps are in
-`buildRouteMaps()` in `main.ts`. Change them there to expose any of these.
+Snapshots, Beta, and Quotas groups in the OpenAPI spec). The rules are in
+`classify()` in `src/routes.rs`. Change them there to expose any of these.
+
+### Arguments and Results
+
+Path and query parameters are top-level arguments, such as `collection_name`.
+The JSON body of a request goes under a single `request_body` argument, as in the
+examples above. A tool result has the HTTP status and the response body:
+`{"status": 200, "body": {...}}`.
 
 ## Using It With an MCP Client
 
-For stdio, point the client at the installed binary, or at `deno task start`
-when running from source. In Claude Code:
+For stdio, point the client at the installed binary, or at
+`target/release/qdrant-data-mcp` after building from source. In Claude Code:
 
 ```sh
 claude mcp add \
@@ -273,42 +304,11 @@ claude mcp add --transport http qdrant-data http://127.0.0.1:8000/mcp
 
 ## Securing the HTTP Server
 
-With `--http` the server can verify JWT bearer tokens against a JWKS endpoint
-and publish
-[protected resource metadata](https://fastmcp-ts.docs.prefect.io/servers/auth/token-verification/),
-so MCP clients can discover your authorization server on their own. Setting any
-auth option turns auth on.
-
-```sh
-deno task start --http \
-  --jwks https://idp.example.com/.well-known/jwks.json \
-  --issuer https://idp.example.com/ \
-  --audience http://127.0.0.1:8000/mcp \
-  --auth-server https://idp.example.com \
-  --public-url http://127.0.0.1:8000
-```
-
-| Flag            | Environment Variable         | Description                                                                                |
-| --------------- | ---------------------------- | ------------------------------------------------------------------------------------------ |
-| `--jwks`        | `AUTH_JWKS_URI`              | JWKS endpoint used to verify token signatures. Required.                                   |
-| `--public-url`  | `AUTH_PUBLIC_URL`            | The URL clients use to reach this server, without `/mcp`. Required.                        |
-| `--auth-server` | `AUTH_AUTHORIZATION_SERVERS` | Issuer URL of an authorization server. Repeat the flag or comma-separate. Required.        |
-| `--issuer`      | `AUTH_ISSUER`                | Required token issuer. Must match the token's `iss` exactly, including any trailing slash. |
-| `--audience`    | `AUTH_AUDIENCE`              | Required token audience. Repeat or comma-separate.                                         |
-
-A few behaviors to know about:
-
-- A partial auth configuration is an error. The server never falls back to
-  running unauthenticated.
-- Auth options without `--http` are also an error. A leftover `AUTH_*` variable
-  will stop a stdio run.
-- Without `--issuer` and `--audience`, the server warns at startup, because it
-  would accept tokens from any issuer sharing the keys or minted for other
-  services.
-- Clients that follow the MCP authorization flow request a token for the MCP URL
-  itself (the RFC 8707 `resource` parameter), so the audience is usually your
-  public URL plus `/mcp`.
-- Run HTTP without auth only on loopback.
+HTTP authentication isn't supported in this version. The server accepts any
+request, and it warns at startup about that. Keep `--http` on `127.0.0.1`, and
+if you need to reach it from elsewhere, put a reverse proxy that handles
+authentication in front of it. Stdio isn't affected, since the client starts the
+process itself.
 
 ## Limitations
 
@@ -316,10 +316,15 @@ A few behaviors to know about:
   from the OpenAPI operations, and there's no curation for LLM use yet.
 - The write tools include destructive operations such as `delete_collection` and
   `delete_points`. Enable writes only against data you can lose.
-- fastmcp-ts doesn't forward inbound HTTP headers to the upstream API, so Qdrant
-  credentials come from `--api-key`, not from the calling client.
+- Qdrant's filters can nest inside each other without limit, which the tool
+  generator can't describe. A filter nested inside a condition is described as
+  "any value", so clients don't get a schema for the inner levels. Qdrant still
+  validates the request.
+- Tool annotations come from the HTTP method. The POST readers, such as
+  `query_points` and `scroll_points`, are marked as not read-only, so some MCP
+  clients may ask for confirmation before running them.
 - The default spec is the one for the Qdrant version in the server's version
-  (`v1.20.0` for `v1.20.0-server.2`). Pass `--openapi` to match a different
+  (`v1.20.0` for `v1.20.0-server.3`). Pass `--openapi` to match a different
   Qdrant version.
-- The macOS and Windows binaries are cross-compiled on Linux and aren't signed.
-  macOS may block an unsigned binary on first run.
+- The Linux binaries need glibc 2.35 or newer. The macOS and Windows binaries
+  aren't signed, and macOS may warn about an unsigned binary on first run.
