@@ -2,3 +2,8 @@ dist/
 qdrant-data-mcp
 .env
 .env.*
+
+
+# Added by cargo
+
+/target
