@@ -1,12 +1,10 @@
-name: CI - Rust
+name: CI
 
 on:
   push:
     branches:
       - main
       - dev
-    tags:
-      - "v@**"
     paths:
       - "src/**"
       - ".github/workflows/ci.yaml"
