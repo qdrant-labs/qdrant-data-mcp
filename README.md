@@ -303,6 +303,16 @@ write tools. For HTTP:
 claude mcp add --transport http qdrant-data http://127.0.0.1:8000/mcp
 ```
 
+### Usage Instructions
+
+The server sends usage guidance to the model when a client connects, in the
+`instructions` field of the initialize response: how arguments and results are
+shaped (`request_body`), how to look up collections, how to write filters,
+how Qdrant Cloud Inference works, and what this server's setup allows (read-only
+or not, whether `local/` models work, and which external providers' models are
+available). The text is in [`src/guide.md`](src/guide.md), and the setup lines at
+the end are generated from the flags you started the server with.
+
 ## Securing the HTTP Server
 
 With `--http` the server can verify JWT bearer tokens against a JWKS endpoint

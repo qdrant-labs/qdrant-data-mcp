@@ -3,13 +3,6 @@ name: Build and Publish Docker Image
 on:
   push:
     tags: ["v*.*.*"]
-    branches: [main]
-    paths:
-      - "Dockerfile"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "src/**"
-      - ".github/workflows/docker-image.yaml"
   workflow_dispatch:
     inputs:
       tag:

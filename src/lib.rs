@@ -2,6 +2,7 @@ pub mod auth;
 pub mod cli;
 pub mod compact;
 pub mod embeddings;
+pub mod guide;
 pub mod qci;
 pub mod refs;
 pub mod routes;
