@@ -109,6 +109,7 @@ async fn run() -> Result<(), String> {
         enable_writes: cli.enable_writes,
         headers: qci::build_headers(cli.api_key.as_deref(), &provider_keys)?,
         embeddings,
+        provider_prefixes: provider_keys.iter().map(|key| key.prefix).collect(),
     })?;
 
     if cli.list {

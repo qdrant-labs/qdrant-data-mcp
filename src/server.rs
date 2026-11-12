@@ -17,7 +17,7 @@ use crate::{
     VERSION,
     compact::compact,
     embeddings::{self, EmbeddingsConfig},
-    refs,
+    guide, refs,
     routes::{self, Route},
 };
 
@@ -27,6 +27,8 @@ pub struct ServerOptions {
     pub enable_writes: bool,
     pub headers: HeaderMap,
     pub embeddings: Option<EmbeddingsConfig>,
+    /// Model prefixes (such as `openai/`) of the providers whose keys are sent to Qdrant.
+    pub provider_prefixes: Vec<&'static str>,
 }
 
 struct Embedder {
@@ -55,6 +57,7 @@ impl Embedder {
 pub struct QdrantServer {
     inner: Server,
     tools: Arc<Vec<McpTool>>,
+    instructions: Arc<String>,
     embedder: Option<Arc<Embedder>>,
 }
 
@@ -77,6 +80,11 @@ pub fn build_server(options: ServerOptions) -> Result<QdrantServer, String> {
         .validate_registry()
         .map_err(|e| format!("Invalid tool registry: {e}"))?;
 
+    let instructions = guide::instructions(
+        options.enable_writes,
+        options.embeddings.is_some(),
+        &options.provider_prefixes,
+    );
     let embedder = options
         .embeddings
         .map(|config| {
@@ -102,6 +110,7 @@ pub fn build_server(options: ServerOptions) -> Result<QdrantServer, String> {
     Ok(QdrantServer {
         inner,
         tools: Arc::new(tools),
+        instructions: Arc::new(instructions),
         embedder,
     })
 }
@@ -129,7 +138,9 @@ impl QdrantServer {
 
 impl ServerHandler for QdrantServer {
     fn get_info(&self) -> InitializeResult {
-        self.inner.get_info()
+        let mut info = self.inner.get_info();
+        info.instructions = Some(self.instructions.to_string());
+        info
     }
 
     async fn list_tools(
@@ -158,5 +169,39 @@ impl ServerHandler for QdrantServer {
             }
         }
         self.inner.call_tool(request, context).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_server_sends_usage_guidance_in_its_instructions() {
+        let spec = json!({
+            "openapi": "3.0.1",
+            "info": { "title": "t", "version": "1" },
+            "paths": { "/collections": { "get": {
+                "operationId": "get_collections",
+                "tags": ["Collections"],
+                "responses": { "200": { "description": "ok" } }
+            }}}
+        });
+        let server = build_server(ServerOptions {
+            base_url: Url::parse("http://localhost:6333").unwrap(),
+            spec,
+            enable_writes: false,
+            headers: HeaderMap::new(),
+            embeddings: None,
+            provider_prefixes: Vec::new(),
+        })
+        .unwrap();
+
+        let info = server.get_info();
+        assert!(info.capabilities.tools.is_some());
+        assert!(info.capabilities.resources.is_none());
+        let instructions = info.instructions.unwrap();
+        assert!(instructions.contains("request_body") && instructions.contains("read-only"));
     }
 }

@@ -1,30 +1,37 @@
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use url::Url;
 
-// (provider, environment variable, header Qdrant Cloud Inference reads it from)
-const PROVIDERS: [(&str, &str, &str); 4] = [
-    ("openrouter", "OPENROUTER_API_KEY", "openrouter-api-key"),
-    ("openai", "OPENAI_API_KEY", "openai-api-key"),
-    ("cohere", "COHERE_API_KEY", "cohere-api-key"),
-    ("jina", "JINA_API_KEY", "jina-api-key"),
+// (provider, environment variable, header Qdrant Cloud Inference reads it from, model prefix)
+const PROVIDERS: [(&str, &str, &str, &str); 4] = [
+    (
+        "openrouter",
+        "OPENROUTER_API_KEY",
+        "openrouter-api-key",
+        "openrouter/",
+    ),
+    ("openai", "OPENAI_API_KEY", "openai-api-key", "openai/"),
+    ("cohere", "COHERE_API_KEY", "cohere-api-key", "cohere/"),
+    ("jina", "JINA_API_KEY", "jina-api-key", "jinaai/"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderKey {
     pub provider: &'static str,
     pub header: &'static str,
+    pub prefix: &'static str,
     pub key: String,
 }
 
 pub fn provider_keys(lookup: impl Fn(&str) -> Option<String>) -> Vec<ProviderKey> {
     PROVIDERS
         .iter()
-        .filter_map(|(provider, var, header)| {
+        .filter_map(|(provider, var, header, prefix)| {
             lookup(var)
                 .filter(|key| !key.is_empty())
                 .map(|key| ProviderKey {
                     provider,
                     header,
+                    prefix,
                     key,
                 })
         })
@@ -53,7 +60,7 @@ pub fn resolve(
 ) -> Result<Vec<ProviderKey>, String> {
     let keys = provider_keys(lookup);
     if keys.is_empty() {
-        let vars: Vec<&str> = PROVIDERS.iter().map(|(_, var, _)| *var).collect();
+        let vars: Vec<&str> = PROVIDERS.iter().map(|(_, var, _, _)| *var).collect();
         return Err(format!(
             "--qci-external-providers is set, but none of {} is in the environment",
             vars.join(", ")
